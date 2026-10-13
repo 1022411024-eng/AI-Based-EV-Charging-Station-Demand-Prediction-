@@ -1,0 +1,6 @@
+{
+  "name": "UrbanEV Demand Intelligence",
+  "description": "AI-based EV charging station demand prediction, grid load forecasting, and station analytics powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
