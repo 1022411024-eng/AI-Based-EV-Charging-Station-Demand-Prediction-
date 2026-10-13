@@ -4,6 +4,9 @@ import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
+import { spawn } from 'child_process';
+import { db, isFirebaseConfigured } from './lib/firebase.js';
 
 dotenv.config();
 
@@ -39,8 +42,8 @@ export interface Station {
   created_at: string;
 }
 
-// Initial seed dataset with realistic metropolitan EV hubs
-let stations: Station[] = [
+// Fallback seed stations if CSV is absent
+const DEFAULT_SEED_STATIONS: Station[] = [
   {
     id: 'stn_001',
     name: 'Downtown Financial Hub Alpha',
@@ -150,6 +153,222 @@ let stations: Station[] = [
     created_at: new Date().toISOString(),
   },
 ];
+
+// Loader that reads data/urban_ev.csv on server startup and groups by station_id
+function loadStationsFromCsv(): Station[] {
+  const csvPath = path.resolve(__dirname, 'data', 'urban_ev.csv');
+  if (!fs.existsSync(csvPath)) {
+    console.log('data/urban_ev.csv not found; falling back to hardcoded seed stations.');
+    return [...DEFAULT_SEED_STATIONS];
+  }
+
+  try {
+    const content = fs.readFileSync(csvPath, 'utf8');
+    const lines = content.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+    if (lines.length < 2) return [...DEFAULT_SEED_STATIONS];
+
+    const headers = lines[0].split(',').map((h) => h.trim().toLowerCase().replace(/"/g, ''));
+    const idIdx = headers.indexOf('station_id');
+    const nameIdx = headers.indexOf('station_name');
+    const cityIdx = headers.indexOf('city');
+    const occIdx = headers.indexOf('occupancy_rate');
+    const powerIdx = headers.indexOf('power_kw');
+    const tempIdx = headers.indexOf('temperature');
+    const rainIdx = headers.indexOf('is_raining');
+
+    const groups: Record<string, {
+      name: string;
+      city: string;
+      occupancies: number[];
+      powers: number[];
+      temps: number[];
+      rains: number[];
+    }> = {};
+
+    for (let i = 1; i < lines.length; i++) {
+      const vals = lines[i].split(',').map((v) => v.trim().replace(/^"|"$/g, ''));
+      if (vals.length < 5) continue;
+      const stnId = vals[idIdx] || `stn_${i}`;
+      if (!groups[stnId]) {
+        groups[stnId] = {
+          name: vals[nameIdx] || `Station ${stnId}`,
+          city: vals[cityIdx] || 'Metropolitan Hub',
+          occupancies: [],
+          powers: [],
+          temps: [],
+          rains: [],
+        };
+      }
+      if (occIdx >= 0 && vals[occIdx]) groups[stnId].occupancies.push(Number(vals[occIdx]));
+      if (powerIdx >= 0 && vals[powerIdx]) groups[stnId].powers.push(Number(vals[powerIdx]));
+      if (tempIdx >= 0 && vals[tempIdx]) groups[stnId].temps.push(Number(vals[tempIdx]));
+      if (rainIdx >= 0 && vals[rainIdx]) groups[stnId].rains.push(Number(vals[rainIdx]));
+    }
+
+    const loadedStations: Station[] = Object.keys(groups).map((id, index) => {
+      const g = groups[id];
+      const avgOcc = g.occupancies.length > 0 ? Math.round(g.occupancies.reduce((a, b) => a + b, 0) / g.occupancies.length) : 60;
+      const avgPower = g.powers.length > 0 ? Math.round(g.powers.reduce((a, b) => a + b, 0) / g.powers.length) : 100;
+      const maxPower = g.powers.length > 0 ? Math.max(...g.powers) : 800;
+      const avgTemp = g.temps.length > 0 ? Math.round(g.temps.reduce((a, b) => a + b, 0) / g.temps.length) : 20;
+      const isRaining = g.rains.filter((r) => r > 0).length / Math.max(1, g.rains.length) > 0.2;
+
+      // Infer charger count from max power observed
+      const inferredChargers = Math.max(8, Math.round(maxPower / Math.max(40, avgPower / 5)));
+      const dcFast = Math.round(inferredChargers * 0.75);
+
+      return {
+        id,
+        name: g.name,
+        city: g.city,
+        address: `${g.name}, ${g.city}`,
+        base_occupancy: avgOcc,
+        base_power: Math.max(40, Math.round(avgPower / (inferredChargers * (avgOcc / 100) || 1))),
+        charger_count: inferredChargers,
+        dc_fast_count: dcFast,
+        ac_level2_count: Math.max(0, inferredChargers - dcFast),
+        max_grid_capacity_kw: inferredChargers * 120,
+        temperature: avgTemp,
+        is_raining: isRaining,
+        weather_condition: isRaining ? 'Rainy' : avgTemp > 28 ? 'Extreme Heat' : 'Clear',
+        peak_tariff_per_kwh: Number((0.40 + (index * 0.03)).toFixed(2)),
+        off_peak_tariff_per_kwh: Number((0.18 + (index * 0.01)).toFixed(2)),
+        created_at: new Date().toISOString(),
+      };
+    });
+
+    console.log(`Loaded ${loadedStations.length} stations from data/urban_ev.csv on startup.`);
+    return loadedStations.length > 0 ? loadedStations : [...DEFAULT_SEED_STATIONS];
+  } catch (err) {
+    console.warn('Error reading data/urban_ev.csv, using default seed stations:', err);
+    return [...DEFAULT_SEED_STATIONS];
+  }
+}
+
+// Initial in-memory cache initialized from data/urban_ev.csv
+let stations: Station[] = loadStationsFromCsv();
+
+// Helper to interact with Firestore collection 'stations' with in-memory fallback
+async function getStationsFromStorage(): Promise<Station[]> {
+  const firestore = db;
+  if (isFirebaseConfigured() && firestore) {
+    try {
+      const snapshot = await firestore.collection('stations').get();
+      if (!snapshot.empty) {
+        return snapshot.docs.map((doc: any) => ({ id: doc.id, ...doc.data() } as Station));
+      } else {
+        // Seed initial stations into Firestore
+        const batch = firestore.batch();
+        stations.forEach((s) => {
+          const docRef = firestore.collection('stations').doc(s.id);
+          batch.set(docRef, s);
+        });
+        await batch.commit();
+        return stations;
+      }
+    } catch (err) {
+      console.warn('Firestore read error, falling back to local storage:', err);
+    }
+  }
+  return stations;
+}
+
+// Helper to spawn Python subprocess ml/predict.py
+async function predictWithPythonModel(station: Station, scenario: ScenarioParams): Promise<HourlyPrediction[] | null> {
+  return new Promise((resolve) => {
+    try {
+      const scriptPath = path.resolve(__dirname, 'ml', 'predict.py');
+      if (!fs.existsSync(scriptPath)) {
+        return resolve(null);
+      }
+
+      const daysOfWeek = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+      const dayName = daysOfWeek[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+      const recordsToPredict = [];
+
+      const basePower = station.base_power || 60;
+      const totalChargers = station.charger_count || 10;
+      const maxCapacityKw = station.max_grid_capacity_kw || totalChargers * 100;
+      const gridLimitFactor = 1 - (scenario.grid_curtailment_pct || 0) / 100;
+      const effectiveGridCapacity = maxCapacityKw * gridLimitFactor;
+
+      for (let h = 0; h < 24; h++) {
+        recordsToPredict.push({
+          station_id: station.id,
+          power_kw: Math.round(station.base_power * station.charger_count * (station.base_occupancy / 100)),
+          temperature: station.temperature + (scenario.temp_delta || 0),
+          is_raining: scenario.weather_override === 'Rainy' ? 1 : station.is_raining ? 1 : 0,
+          day_of_week: dayName,
+          hour: h,
+        });
+      }
+
+      const pyProcess = spawn('python3', [scriptPath]);
+      let stdoutData = '';
+      let stderrData = '';
+
+      pyProcess.stdout.on('data', (chunk) => {
+        stdoutData += chunk.toString();
+      });
+
+      pyProcess.stderr.on('data', (chunk) => {
+        stderrData += chunk.toString();
+      });
+
+      pyProcess.on('close', (code) => {
+        if (code !== 0 || !stdoutData.trim()) {
+          console.warn('Python predict.py exited with code', code, stderrData);
+          return resolve(null);
+        }
+
+        try {
+          const parsed = JSON.parse(stdoutData.trim());
+          const predictionsList = Array.isArray(parsed) ? parsed : parsed.predictions || [parsed];
+          if (predictionsList.length !== 24) return resolve(null);
+
+          const predictions: HourlyPrediction[] = predictionsList.map((item: any, i: number) => {
+            const timeLabel = `${String(i).padStart(2, '0')}:00`;
+            const occ = Math.min(100, Math.max(5, Math.round(Number(item.predicted_occupancy_rate))));
+            const activePorts = Math.max(1, Math.min(totalChargers, Math.round((occ / 100) * totalChargers)));
+            const rawPower = Math.round(activePorts * basePower * (0.85 + (occ / 100) * 0.25));
+            const predictedPower = Math.min(effectiveGridCapacity, rawPower);
+            const gridStress = Math.min(100, Math.round((predictedPower / effectiveGridCapacity) * 100));
+
+            const isPeakHour = (i >= 8 && i <= 11) || (i >= 17 && i <= 20);
+            const baseTariff = isPeakHour ? station.peak_tariff_per_kwh : station.off_peak_tariff_per_kwh;
+            const effectiveTariff = Number((baseTariff * (scenario.tariff_multiplier || 1)).toFixed(3));
+
+            return {
+              time: timeLabel,
+              hour: i,
+              occupancy: occ,
+              power_kw: predictedPower,
+              active_ports: activePorts,
+              grid_stress_pct: gridStress,
+              estimated_cost_per_kwh: effectiveTariff,
+            };
+          });
+
+          resolve(predictions);
+        } catch (parseErr) {
+          console.warn('Failed to parse Python model predictions:', parseErr);
+          resolve(null);
+        }
+      });
+
+      pyProcess.on('error', (err) => {
+        console.warn('Failed to spawn Python process:', err);
+        resolve(null);
+      });
+
+      pyProcess.stdin.write(JSON.stringify(recordsToPredict));
+      pyProcess.stdin.end();
+    } catch (err) {
+      console.warn('Python predict wrapper error:', err);
+      resolve(null);
+    }
+  });
+}
 
 // Modular UrbanEV Demand Prediction Engine
 export interface HourlyPrediction {
@@ -322,12 +541,14 @@ async function startServer() {
   const apiRouter = express.Router();
 
   // 1. GET /api/stations
-  apiRouter.get('/stations', (req: Request, res: Response) => {
+  apiRouter.get('/stations', async (req: Request, res: Response) => {
     try {
       const search = (req.query.search as string || '').toLowerCase();
       const city = (req.query.city as string || '').toLowerCase();
 
-      let filtered = [...stations];
+      const allStations = await getStationsFromStorage();
+      let filtered = [...allStations];
+
       if (search) {
         filtered = filtered.filter(
           (s) =>
@@ -351,16 +572,28 @@ async function startServer() {
   });
 
   // 2. GET /api/stations/:id
-  apiRouter.get('/stations/:id', (req: Request, res: Response) => {
-    const station = stations.find((s) => s.id === req.params.id);
-    if (!station) {
-      return res.status(404).json({ error: 'Station not found' });
+  apiRouter.get('/stations/:id', async (req: Request, res: Response) => {
+    try {
+      if (isFirebaseConfigured() && db) {
+        const doc = await db.collection('stations').doc(req.params.id).get();
+        if (doc.exists) {
+          return res.json({ success: true, station: { id: doc.id, ...doc.data() } });
+        }
+      }
+
+      const allStations = await getStationsFromStorage();
+      const station = allStations.find((s) => s.id === req.params.id);
+      if (!station) {
+        return res.status(404).json({ error: 'Station not found' });
+      }
+      res.json({ success: true, station });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
     }
-    res.json({ success: true, station });
   });
 
   // 3. POST /api/stations
-  apiRouter.post('/stations', (req: Request, res: Response) => {
+  apiRouter.post('/stations', async (req: Request, res: Response) => {
     try {
       const body = req.body;
       if (!body.name || !body.city) {
@@ -390,6 +623,15 @@ async function startServer() {
         created_at: new Date().toISOString(),
       };
 
+      // Store in Firestore if configured
+      if (isFirebaseConfigured() && db) {
+        try {
+          await db.collection('stations').doc(newStation.id).set(newStation);
+        } catch (fbErr) {
+          console.warn('Failed to write station to Firestore, saved to local cache:', fbErr);
+        }
+      }
+
       stations.unshift(newStation);
       res.status(201).json({ success: true, station: newStation });
     } catch (err: any) {
@@ -398,7 +640,7 @@ async function startServer() {
   });
 
   // 4. POST /api/stations/batch-csv
-  apiRouter.post('/stations/batch-csv', (req: Request, res: Response) => {
+  apiRouter.post('/stations/batch-csv', async (req: Request, res: Response) => {
     try {
       const { csv_content } = req.body;
       if (!csv_content || typeof csv_content !== 'string') {
@@ -455,6 +697,21 @@ async function startServer() {
         addedStations.push(station);
       }
 
+      // Store in Firestore batch if configured
+      const firestoreBatch = db;
+      if (isFirebaseConfigured() && firestoreBatch && addedStations.length > 0) {
+        try {
+          const batch = firestoreBatch.batch();
+          addedStations.forEach((s) => {
+            const docRef = firestoreBatch.collection('stations').doc(s.id);
+            batch.set(docRef, s);
+          });
+          await batch.commit();
+        } catch (fbErr) {
+          console.warn('Firestore batch error, stored in local cache:', fbErr);
+        }
+      }
+
       res.json({
         success: true,
         message: `Successfully ingested ${addedStations.length} station records`,
@@ -467,121 +724,28 @@ async function startServer() {
   });
 
   // 5. POST /api/stations/reset-defaults
-  apiRouter.post('/stations/reset-defaults', (_req: Request, res: Response) => {
-    stations = [
-      {
-        id: 'stn_001',
-        name: 'Downtown Financial Hub Alpha',
-        city: 'San Francisco',
-        address: '420 Montgomery St, San Francisco, CA',
-        base_occupancy: 68,
-        base_power: 120,
-        charger_count: 16,
-        dc_fast_count: 12,
-        ac_level2_count: 4,
-        max_grid_capacity_kw: 1600,
-        temperature: 17,
-        is_raining: false,
-        weather_condition: 'Clear',
-        peak_tariff_per_kwh: 0.48,
-        off_peak_tariff_per_kwh: 0.22,
-        created_at: new Date().toISOString(),
-      },
-      {
-        id: 'stn_002',
-        name: 'Silicon Valley Innovation Supercharger',
-        city: 'San Jose',
-        address: '300 Santana Row, San Jose, CA',
-        base_occupancy: 82,
-        base_power: 150,
-        charger_count: 24,
-        dc_fast_count: 20,
-        ac_level2_count: 4,
-        max_grid_capacity_kw: 2800,
-        temperature: 24,
-        is_raining: false,
-        weather_condition: 'Clear',
-        peak_tariff_per_kwh: 0.44,
-        off_peak_tariff_per_kwh: 0.20,
-        created_at: new Date().toISOString(),
-      },
-      {
-        id: 'stn_003',
-        name: 'Metro Transit Plaza & Depot',
-        city: 'Oakland',
-        address: '1200 Broadway, Oakland, CA',
-        base_occupancy: 45,
-        base_power: 75,
-        charger_count: 12,
-        dc_fast_count: 6,
-        ac_level2_count: 6,
-        max_grid_capacity_kw: 900,
-        temperature: 15,
-        is_raining: true,
-        weather_condition: 'Rainy',
-        peak_tariff_per_kwh: 0.38,
-        off_peak_tariff_per_kwh: 0.18,
-        created_at: new Date().toISOString(),
-      },
-      {
-        id: 'stn_004',
-        name: 'South Lake Union Fleet Hub',
-        city: 'Seattle',
-        address: '500 Westlake Ave N, Seattle, WA',
-        base_occupancy: 74,
-        base_power: 110,
-        charger_count: 20,
-        dc_fast_count: 16,
-        ac_level2_count: 4,
-        max_grid_capacity_kw: 2200,
-        temperature: 12,
-        is_raining: true,
-        weather_condition: 'Rainy',
-        peak_tariff_per_kwh: 0.36,
-        off_peak_tariff_per_kwh: 0.16,
-        created_at: new Date().toISOString(),
-      },
-      {
-        id: 'stn_005',
-        name: 'Barton Springs Green Mobility Hub',
-        city: 'Austin',
-        address: '2200 Barton Springs Rd, Austin, TX',
-        base_occupancy: 58,
-        base_power: 90,
-        charger_count: 14,
-        dc_fast_count: 8,
-        ac_level2_count: 6,
-        max_grid_capacity_kw: 1200,
-        temperature: 31,
-        is_raining: false,
-        weather_condition: 'Extreme Heat',
-        peak_tariff_per_kwh: 0.42,
-        off_peak_tariff_per_kwh: 0.19,
-        created_at: new Date().toISOString(),
-      },
-      {
-        id: 'stn_006',
-        name: 'Midtown West Commercial Depot',
-        city: 'New York',
-        address: '600 W 42nd St, New York, NY',
-        base_occupancy: 88,
-        base_power: 160,
-        charger_count: 28,
-        dc_fast_count: 24,
-        ac_level2_count: 4,
-        max_grid_capacity_kw: 3600,
-        temperature: 19,
-        is_raining: false,
-        weather_condition: 'Overcast',
-        peak_tariff_per_kwh: 0.54,
-        off_peak_tariff_per_kwh: 0.26,
-        created_at: new Date().toISOString(),
-      },
-    ];
+  apiRouter.post('/stations/reset-defaults', async (_req: Request, res: Response) => {
+    stations = loadStationsFromCsv();
+
+    const firestoreReset = db;
+    if (isFirebaseConfigured() && firestoreReset) {
+      try {
+        const batch = firestoreReset.batch();
+        // Overwrite or reset
+        stations.forEach((s) => {
+          const docRef = firestoreReset.collection('stations').doc(s.id);
+          batch.set(docRef, s);
+        });
+        await batch.commit();
+      } catch (fbErr) {
+        console.warn('Firestore reset error:', fbErr);
+      }
+    }
+
     res.json({ success: true, count: stations.length, stations });
   });
 
-  // 6. POST /api/predict: ML Demand Prediction + Gemini AI Natural Language Synthesis
+  // 6. POST /api/predict: ML Demand Prediction (Python Subprocess) + Gemini Synthesis
   apiRouter.post('/predict', async (req: Request, res: Response) => {
     try {
       const { station_id, scenario } = req.body;
@@ -589,13 +753,30 @@ async function startServer() {
         return res.status(400).json({ error: 'station_id is required' });
       }
 
-      const station = stations.find((s) => s.id === station_id);
+      const allStations = await getStationsFromStorage();
+      const station = allStations.find((s) => s.id === station_id) || stations.find((s) => s.id === station_id);
       if (!station) {
         return res.status(404).json({ error: 'Station not found' });
       }
 
-      // Execute ML Prediction Algorithm
+      // Execute ML Prediction Algorithm:
+      // Primary: Spawns Python subprocess python3 ml/predict.py passing features on stdin
+      // Fallback: Rules-based runPredictionEngine if Python call fails or is unavailable
+      const pyPredictions = await predictWithPythonModel(station, scenario || {});
       const engineResult = runPredictionEngine(station, scenario || {});
+
+      if (pyPredictions && pyPredictions.length === 24) {
+        engineResult.predictions = pyPredictions;
+        engineResult.metrics.peakOccupancy = Math.max(...pyPredictions.map((p) => p.occupancy));
+        engineResult.metrics.peakPowerKw = Math.max(...pyPredictions.map((p) => p.power_kw));
+        engineResult.metrics.avgOccupancy = Math.round(pyPredictions.reduce((acc, p) => acc + p.occupancy, 0) / 24);
+        engineResult.metrics.totalDailyKwh = pyPredictions.reduce((acc, p) => acc + p.power_kw, 0);
+        engineResult.metrics.carbonOffsetKg = Math.round(engineResult.metrics.totalDailyKwh * 0.412);
+        engineResult.metrics.estimatedRevenue = Math.round(
+          pyPredictions.reduce((acc, p) => acc + p.power_kw * p.estimated_cost_per_kwh, 0)
+        );
+      }
+
       const { predictions, historical, weeklyPredictions, metrics } = engineResult;
 
       // Identify peak stress windows
@@ -708,8 +889,9 @@ Respond strictly in valid JSON format:
               weather_impact: parsed.weather_impact || aiAnalysis.weather_impact,
             };
           }
-        } catch (_geminiError) {
-          // In sandboxed environments or when permission is restricted, gracefully use the analytical engine
+        } catch (_geminiError: any) {
+          // Gracefully fall back to local high-fidelity analytical intelligence
+          // when Gemini API quota is exhausted, rate-limited, or access is restricted.
         }
       }
 
